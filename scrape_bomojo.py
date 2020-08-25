@@ -1,65 +1,123 @@
-import os
-
 from bs4 import BeautifulSoup
 import requests
+import sqlite3
+import logging
+
+from db import get_connection
 
 URL_FORMAT = "https://www.boxofficemojo.com/year/{year}/"
 
 
-def get_cached_filename(year):
-    return "cached_html/%d.html" % year
+def null_func(x):
+    return x
 
 
-def get_cached_year(year):
-    try:
-        with open(get_cached_filename(year), 'r') as fp:
-            return fp.read()
-    except FileNotFoundError:
-        return False
+def dollars(x):
+    dol = x.strip("$")
+    return to_int(dol)
 
 
-def cache_contents(year, content):
-    with open(get_cached_filename(year), 'wb') as fp:
-        fp.write(content)
+def to_int(x):
+    return int(x.replace(",", ""))
 
 
-def get_raw_year(year):
-    content = get_cached_year(year)
-    if content:
-        return content
-    url = URL_FORMAT.format(year=year)
-    print(url)
-    res = requests.get(url)  
-    cache_contents(year, res.content)
-    return res.content
+FORMAT_MAP = {0: to_int, 1: null_func, 5: dollars, 8: null_func}
 
 
-def parse_res(content, num_films=10):
-    films = []
-    soup = BeautifulSoup(content, 'html.parser')
-    table = soup.find('table')
-    keep = {0, 1, 5, 6, 8}
-    for n, tr in enumerate(table.find_all('tr')):
-        this_film = []
-        for tn, td in enumerate(tr.find_all('td')):
-            print(td.string)
-            if tn in keep:
-                this_film.append(td.string)
-        if this_film:
-            films.append(this_film)
-        print(n)
-        print("+"*30)
-        if len(films)>=num_films:
-            break
-    films.reverse()
-    from pprint import pprint
-    pprint(films)
-    return films
+class BoxOfficeYear:
+    def __init__(self, year):
+        self._content = None
+        self.year = year
+
+    @property
+    def cached_filename(self):
+        return "cached_html/%d.html" % self.year
+
+    def _get_cached_year(self):
+        try:
+            with open(self.cached_filename, 'r') as fp:
+                return fp.read()
+        except FileNotFoundError:
+            return False
+
+    def _cache_contents(self):
+        with open(self.cached_filename, 'wb') as fp:
+            fp.write(self._content)
+
+    @property
+    def url(self):
+        return URL_FORMAT.format(year=self.year)
+
+    @property
+    def content(self):
+        self._content = self._get_cached_year()
+        if self._content:
+            return self._content
+        res = requests.get(self.url)
+        self._content = res.content
+        self._cache_contents()
+        return self._content
+
+    def parse_res(self, num_films=None):
+        films = []
+        soup = BeautifulSoup(self.content, 'html.parser')
+        table = soup.find('table')
+        for n, tr in enumerate(table.find_all('tr')):
+            this_film = []
+            for tn, td in enumerate(tr.find_all('td')):
+                if tn==1:
+                    film_url = tr.find("a")['href']
+                    film_url = film_url.split("?")[0]
+                    film_url = "https://www.boxofficemojo.com" + film_url
+                    this_film.append(film_url)
+                if tn in FORMAT_MAP.keys():
+                    text = td.string
+                    if not text:
+                        text = td.find("a").string
+                        if not text:
+                            raise Exception(td)
+                    value = FORMAT_MAP[tn](text)
+                    this_film.append(value)
+            if this_film:
+                films.append(this_film)
+            if num_films and len(films) >= num_films:
+                break
+        return films
+
+    def publish_to_db(self, film):
+        film.append(self.year)
+        film.append(self.url)
+        sql = ''' INSERT INTO Film(
+        Domestic_BO_Rank, 
+        BOMojoFilmURL,
+        Name, 
+        Gross_Dollar, 
+        Release_Date_Raw, 
+        BO_Year, 
+        BOMojoTableURL) 
+        VALUES(?,?,?,?,?,?,?)'''
+        conn = get_connection()
+        cur = conn.cursor()
+        logging.debug(film)
+        try:
+            cur.execute(sql, film)
+        except sqlite3.IntegrityError:
+            logging.warning("Film appeared before:%s" % film)
+        conn.commit()
+        conn.close()
+
+    def populate_db(self):
+        films = self.parse_res()
+        for film in films:
+            self.publish_to_db(film)
 
     
 def main():
-    res = get_raw_year(2018)
-    parse_res(res)
+    # earliest 1977
+    for year in range(1978, 2020):
+        bo_year = BoxOfficeYear(year)
+        bo_year.populate_db()
+        logging.info(bo_year.url)
 
 if __name__=="__main__":
     main()
